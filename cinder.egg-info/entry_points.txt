@@ -1,0 +1,25 @@
+[cinder.scheduler.filters]
+AvailabilityZoneFilter = cinder.openstack.common.scheduler.filters.availability_zone_filter:AvailabilityZoneFilter
+CapabilitiesFilter = cinder.openstack.common.scheduler.filters.capabilities_filter:CapabilitiesFilter
+CapacityFilter = cinder.scheduler.filters.capacity_filter:CapacityFilter
+DifferentBackendFilter = cinder.scheduler.filters.affinity_filter:DifferentBackendFilter
+JsonFilter = cinder.openstack.common.scheduler.filters.json_filter:JsonFilter
+RetryFilter = cinder.openstack.common.scheduler.filters.ignore_attempted_hosts_filter:IgnoreAttemptedHostsFilter
+SameBackendFilter = cinder.scheduler.filters.affinity_filter:SameBackendFilter
+
+[cinder.scheduler.weights]
+AllocatedCapacityWeigher = cinder.scheduler.weights.capacity:AllocatedCapacityWeigher
+CapacityWeigher = cinder.scheduler.weights.capacity:CapacityWeigher
+ChanceWeigher = cinder.scheduler.weights.chance:ChanceWeigher
+VolumeNumberWeigher = cinder.scheduler.weights.volume_number:VolumeNumberWeigher
+
+[console_scripts]
+cinder-rootwrap = oslo.rootwrap.cmd:main
+
+[oslo.messaging.notify.drivers]
+cinder.openstack.common.notifier.log_notifier = oslo.messaging.notify._impl_log:LogDriver
+cinder.openstack.common.notifier.no_op_notifier = oslo.messaging.notify._impl_noop:NoOpDriver
+cinder.openstack.common.notifier.rpc_notifier = oslo.messaging.notify._impl_messaging:MessagingDriver
+cinder.openstack.common.notifier.rpc_notifier2 = oslo.messaging.notify._impl_messaging:MessagingV2Driver
+cinder.openstack.common.notifier.test_notifier = oslo.messaging.notify._impl_test:TestDriver
+
