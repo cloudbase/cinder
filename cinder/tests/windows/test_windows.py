@@ -31,10 +31,10 @@ from cinder import test
 from cinder.tests.windows import db_fakes
 from cinder.volume import configuration as conf
 from cinder.volume.drivers.windows import constants
+from cinder.volume.drivers.windows import imagecache
 from cinder.volume.drivers.windows import vhdutils
 from cinder.volume.drivers.windows import windows
 from cinder.volume.drivers.windows import windows_utils
-
 
 CONF = cfg.CONF
 
@@ -69,11 +69,22 @@ class TestWindowsDriver(test.TestCase):
         return os.path.join(CONF.windows_iscsi_lun_path,
                             str(volume['name']) + ".vhd")
 
+    def _fake_check_min_windows_version(self, major, minor, build=0):
+        return True
+
     def test_check_for_setup_errors(self):
         drv = self._driver
+
+        self.flags(use_cow_images=True, group='imagecache')
+
         self.mox.StubOutWithMock(windows_utils.WindowsUtils,
                                  'check_for_setup_error')
+        self.stubs.Set(windows_utils.WindowsUtils,
+                       'check_min_windows_version',
+                       self._fake_check_min_windows_version)
+
         windows_utils.WindowsUtils.check_for_setup_error()
+        windows_utils.WindowsUtils.check_min_windows_version(6, 3)
 
         self.mox.ReplayAll()
 
@@ -156,19 +167,35 @@ class TestWindowsDriver(test.TestCase):
 
         drv.delete_snapshot(snapshot)
 
-    def test_create_export(self):
+    def _test_create_export(self, chap_enabled=False):
         drv = self._driver
-
         volume = db_fakes.get_fake_volume_info()
-
         initiator_name = "%s%s" % (CONF.iscsi_target_prefix, volume['name'])
+        fake_chap_username = 'fake_chap_username'
+        fake_chap_password = 'fake_chap_password'
 
-        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
-                                 'create_iscsi_target')
-        windows_utils.WindowsUtils.create_iscsi_target(initiator_name,
-                                                       mox.IgnoreArg())
+        self.flags(use_chap_auth=chap_enabled)
+        self.flags(chap_username=fake_chap_username)
+        self.flags(chap_password=fake_chap_password)
+
         self.mox.StubOutWithMock(windows_utils.WindowsUtils,
                                  'add_disk_to_target')
+        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
+                                 'create_iscsi_target')
+        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
+                                 'set_chap_credentials')
+        self.mox.StubOutWithMock(self._driver,
+                                 'remove_export')
+
+        self._driver.remove_export(mox.IgnoreArg(), mox.IgnoreArg())
+        windows_utils.WindowsUtils.create_iscsi_target(initiator_name)
+
+        if chap_enabled:
+            windows_utils.WindowsUtils.set_chap_credentials(
+                mox.IgnoreArg(),
+                fake_chap_username,
+                fake_chap_password)
+
         windows_utils.WindowsUtils.add_disk_to_target(volume['name'],
                                                       initiator_name)
 
@@ -176,7 +203,19 @@ class TestWindowsDriver(test.TestCase):
 
         export_info = drv.create_export(None, volume)
 
-        self.assertEqual(export_info['provider_location'], initiator_name)
+        self.assertEqual(initiator_name, export_info['provider_location'])
+        if chap_enabled:
+            expected_provider_auth = ' '.join(('CHAP',
+                                               fake_chap_username,
+                                               fake_chap_password))
+            self.assertEqual(expected_provider_auth,
+                             export_info['provider_auth'])
+
+    def test_create_export_chap_disabled(self):
+        self._test_create_export()
+
+    def test_create_export_chap_enabled(self):
+        self._test_create_export(chap_enabled=True)
 
     def test_initialize_connection(self):
         drv = self._driver
@@ -216,25 +255,6 @@ class TestWindowsDriver(test.TestCase):
 
         drv.terminate_connection(volume, connector)
 
-    def test_ensure_export(self):
-        drv = self._driver
-
-        volume = db_fakes.get_fake_volume_info()
-
-        initiator_name = "%s%s" % (CONF.iscsi_target_prefix, volume['name'])
-
-        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
-                                 'create_iscsi_target')
-        windows_utils.WindowsUtils.create_iscsi_target(initiator_name, True)
-        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
-                                 'add_disk_to_target')
-        windows_utils.WindowsUtils.add_disk_to_target(volume['name'],
-                                                      initiator_name)
-
-        self.mox.ReplayAll()
-
-        drv.ensure_export(None, volume)
-
     def test_remove_export(self):
         drv = self._driver
 
@@ -262,35 +282,20 @@ class TestWindowsDriver(test.TestCase):
                        fake_get_supported_type)
 
         self.mox.StubOutWithMock(os, 'unlink')
-        self.mox.StubOutWithMock(image_utils, 'create_temporary_file')
-        self.mox.StubOutWithMock(image_utils, 'fetch_to_vhd')
-        self.mox.StubOutWithMock(vhdutils.VHDUtils, 'convert_vhd')
-        self.mox.StubOutWithMock(vhdutils.VHDUtils, 'resize_vhd')
+        self.mox.StubOutWithMock(imagecache.WindowsImageCache, 'get_image')
         self.mox.StubOutWithMock(windows_utils.WindowsUtils,
                                  'change_disk_status')
 
-        fake_temp_path = r'C:\fake\temp\file'
-        if (CONF.image_conversion_dir and not
-                os.path.exists(CONF.image_conversion_dir)):
-            os.makedirs(CONF.image_conversion_dir)
-        image_utils.create_temporary_file(suffix='.vhd').AndReturn(
-            fake_temp_path)
-
         fake_volume_path = self.fake_local_path(volume)
 
-        image_utils.fetch_to_vhd(None, None, None,
-                                 fake_temp_path,
-                                 mox.IgnoreArg())
         windows_utils.WindowsUtils.change_disk_status(volume['name'],
-                                                      mox.IsA(bool))
-        vhdutils.VHDUtils.convert_vhd(fake_temp_path,
-                                      fake_volume_path,
-                                      constants.VHD_TYPE_FIXED)
-        vhdutils.VHDUtils.resize_vhd(fake_volume_path,
-                                     volume['size'] << 30)
-        windows_utils.WindowsUtils.change_disk_status(volume['name'],
-                                                      mox.IsA(bool))
+                                                      False)
         os.unlink(mox.IsA(str))
+        imagecache.WindowsImageCache.get_image(
+            None, None, None, fake_volume_path, 'vhd', volume['size'],
+            image_subformat=constants.VHD_SUBFORMAT_FIXED)
+        windows_utils.WindowsUtils.change_disk_status(volume['name'],
+                                                      True)
 
         self.mox.ReplayAll()
 
@@ -356,20 +361,15 @@ class TestWindowsDriver(test.TestCase):
                                  'copy_vhd_disk')
         self.mox.StubOutWithMock(windows_utils.WindowsUtils,
                                  'import_wt_disk')
-        self.mox.StubOutWithMock(vhdutils.VHDUtils,
-                                 'resize_vhd')
+        self.mox.StubOutWithMock(windows_utils.WindowsUtils,
+                                 'extend_vhd_if_needed')
 
-        self.stubs.Set(drv.utils,
-                       'is_resize_needed',
-                       lambda vhd_path, new_size, old_size: True)
         self.stubs.Set(drv, 'local_path', self.fake_local_path)
 
         windows_utils.WindowsUtils.copy_vhd_disk(src_vhd_path,
                                                  new_vhd_path)
-        drv.utils.is_resize_needed(new_vhd_path,
-                                   volume['size'],
-                                   volume_cloned['size'])
-        vhdutils.VHDUtils.resize_vhd(new_vhd_path, volume['size'] << 30)
+        windows_utils.WindowsUtils.extend_vhd_if_needed(new_vhd_path,
+                                                        volume['size'])
         windows_utils.WindowsUtils.import_wt_disk(new_vhd_path,
                                                   volume['name'])
 

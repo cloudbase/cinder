@@ -18,16 +18,19 @@ Utility class for Windows Storage Server 2012 volume related operations.
 
 import ctypes
 import os
+import sys
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils import units
 
 from cinder import exception
 from cinder.i18n import _, _LI
 from cinder.volume.drivers.windows import constants
+from cinder.volume.drivers.windows import vhdutils
 
 # Check needed for unit testing on Unix
-if os.name == 'nt':
+if sys.platform == 'win32':
     import wmi
 
     from ctypes import wintypes
@@ -44,6 +47,7 @@ class WindowsUtils(object):
         # Set the flags
         self._conn_wmi = wmi.WMI(moniker='//./root/wmi')
         self._conn_cimv2 = wmi.WMI(moniker='//./root/cimv2')
+        self._vhdutils = vhdutils.VHDUtils()
 
     def check_for_setup_error(self):
         """Check that the driver is working and can communicate.
@@ -268,14 +272,13 @@ class WindowsUtils(object):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
-    def create_iscsi_target(self, target_name, ensure):
+    def create_iscsi_target(self, target_name):
         """Creates ISCSI target."""
         try:
-            cl = self._conn_wmi.__getattr__("WT_Host")
-            cl.NewHost(HostName=target_name)
+            self._conn_wmi.WT_Host.NewHost(HostName=target_name)
         except wmi.x_wmi as exc:
             excep_info = exc.com_error.excepinfo[2]
-            if not ensure or excep_info.find(u'The file exists') == -1:
+            if excep_info.find(u'The file exists') != -1:
                 err_msg = (_(
                     'create_iscsi_target: error when creating iscsi target: '
                     '%(tar_name)s . WMI exception: '
@@ -283,8 +286,8 @@ class WindowsUtils(object):
                 LOG.error(err_msg)
                 raise exception.VolumeBackendAPIException(data=err_msg)
             else:
-                LOG.info(_LI('Ignored target creation error "%s"'
-                             ' while ensuring export'), exc)
+                LOG.info(_LI('The iSCSI target %(target_name)s already '
+                             'exists.'), {'target_name': target_name})
 
     def remove_iscsi_target(self, target_name):
         """Removes ISCSI target."""
@@ -304,6 +307,28 @@ class WindowsUtils(object):
                 '%(wmi_exc)s') % {'tar_name': target_name, 'wmi_exc': exc})
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
+
+    def set_chap_credentials(self, target_name, chap_username, chap_password):
+        try:
+            wt_host = self._conn_wmi.WT_Host(HostName=target_name)[0]
+            self._wmi_obj_set_attr(wt_host, 'EnableCHAP', True)
+            self._wmi_obj_set_attr(wt_host, 'CHAPUserName', chap_username)
+            self._wmi_obj_set_attr(wt_host, 'CHAPSecret', chap_password)
+            wt_host.put()
+        except wmi.x_wmi as exc:
+            err_msg = (_('Failed to set CHAP credentials on '
+                         'target %(target_name)s. WMI exception: %(wmi_exc)s')
+                       % {'target_name': target_name,
+                          'wmi_exc': exc})
+            LOG.error(err_msg)
+            raise exception.VolumeBackendAPIException(data=err_msg)
+
+    @staticmethod
+    def _wmi_obj_set_attr(wmi_obj, key, value):
+        # Due to a bug in the python WMI module, some wmi object attributes
+        # cannot be modified. This method is used as a workaround.
+        wmi_property = getattr(wmi_obj, 'wmi_property')
+        wmi_property(key).set(value)
 
     def add_disk_to_target(self, vol_name, target_name):
         """Adds the disk to the target."""
@@ -349,7 +374,7 @@ class WindowsUtils(object):
             LOG.error(err_msg)
             raise exception.VolumeBackendAPIException(data=err_msg)
 
-    def is_resize_needed(self, vhd_path, new_size, old_size):
+    def _is_resize_needed(self, vhd_path, new_size, old_size):
         if new_size > old_size:
             return True
         elif old_size > new_size:
@@ -362,6 +387,17 @@ class WindowsUtils(object):
                         'new_size': new_size})
             raise exception.VolumeBackendAPIException(data=err_msg)
         return False
+
+    def extend_vhd_if_needed(self, vhd_path, new_size_gb):
+        old_size_bytes = self._vhdutils.get_vhd_size(vhd_path)['VirtualSize']
+        new_size_bytes = new_size_gb * units.Gi
+
+        # This also ensures we're not attempting to shrink the image.
+        is_resize_needed = self._is_resize_needed(vhd_path,
+                                                  new_size_bytes,
+                                                  old_size_bytes)
+        if is_resize_needed:
+            self._vhdutils.resize_vhd(vhd_path, new_size_bytes)
 
     def extend(self, vol_name, additional_size):
         """Extend an existing volume."""

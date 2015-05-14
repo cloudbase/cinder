@@ -161,8 +161,10 @@ class VHDUtilsTestCase(test.TestCase):
     def test_open_failed(self):
         self._test_open(open_failed=True)
 
-    def _test_get_device_id_by_path(self,
+    @mock.patch('os.path.exists')
+    def _test_get_device_id_by_path(self, mock_exists,
                                     get_device_failed=False):
+        mock_exists.return_value = False
         if get_device_failed:
             self.assertRaises(exception.VolumeBackendAPIException,
                               self._vhdutils._get_device_id_by_path,
@@ -265,8 +267,6 @@ class VHDUtilsTestCase(test.TestCase):
                               self._vhdutils._get_vhd_info_member,
                               self._FAKE_VHD_PATH,
                               vhdutils.GET_VIRTUAL_DISK_INFO_SIZE)
-            self._vhdutils._close.assert_called_with(
-                self._FAKE_VHD_PATH)
         else:
             self._vhdutils._get_vhd_info_member(
                 self._FAKE_VHD_PATH,

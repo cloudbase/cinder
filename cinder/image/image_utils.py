@@ -49,10 +49,17 @@ LOG = logging.getLogger(__name__)
 image_helper_opt = [cfg.StrOpt('image_conversion_dir',
                                default='$state_path/conversion',
                                help='Directory used for temporary storage '
-                                    'during image conversion'), ]
+                                    'during image conversion'),
+                    cfg.BoolOpt('enable_vhd_check',
+                                default=True,
+                                help='Enable checking images reported as raw '
+                                     'for the VHD format signature in order '
+                                     'to workaround a known qemu-img bug.'), ]
 
 CONF = cfg.CONF
 CONF.register_opts(image_helper_opt)
+
+VHD_SIGNATURE = 'conectix'
 
 
 def qemu_img_info(path, run_as_root=True):
@@ -61,7 +68,26 @@ def qemu_img_info(path, run_as_root=True):
     if os.name == 'nt':
         cmd = cmd[2:]
     out, _err = utils.execute(*cmd, run_as_root=run_as_root)
-    return imageutils.QemuImgInfo(out)
+    info = imageutils.QemuImgInfo(out)
+    if info.file_format == 'raw' and CONF.enable_vhd_check and _is_vhd(path):
+        info.file_format = 'vpc'
+    return info
+
+
+def _is_vhd(path):
+    # qemu-img cannot recognise fixed VHD images due to the fact that it
+    # seeks the VHD signature at the wrong offset.
+    # TODO(lpetrut): Remove this after this fix merges:
+    # https://patchwork.ozlabs.org/patch/375762/
+    with open(path, 'rb') as f:
+        # Read footer
+        f.seek(0, 2)
+        file_size = f.tell()
+        if file_size >= 512:
+            f.seek(-512, 2)
+            if f.read(8) == VHD_SIGNATURE:
+                return True
+    return False
 
 
 def get_qemu_img_version():
@@ -94,12 +120,31 @@ def check_qemu_img_version(minimum_version):
         raise exception.VolumeBackendAPIException(data=_msg)
 
 
-def _convert_image(prefix, source, dest, out_format, run_as_root=True):
+def _get_qemu_convert_cmd(src, dest, out_format, out_subformat=None,
+                          cache_mode=None, prefix=None):
+    if out_format == 'vhd':
+        # qemu-img still uses the legacy vpc name
+        out_format == 'vpc'
+
+    cmd = ('qemu-img', 'convert', '-O', out_format)
+
+    if cache_mode:
+        cmd += ('-t', cache_mode)
+
+    if out_subformat:
+        cmd += ('-o', 'subformat=%s' % out_subformat)
+
+    if prefix:
+        cmd = prefix + cmd
+
+    cmd += (src, dest)
+
+    return cmd
+
+
+def _convert_image(prefix, source, dest, out_format,
+                   out_subformat=None, run_as_root=True):
     """Convert image to other format."""
-
-    cmd = prefix + ('qemu-img', 'convert',
-                    '-O', out_format, source, dest)
-
     # Check whether O_DIRECT is supported and set '-t none' if it is
     # This is needed to ensure that all data hit the device before
     # it gets unmapped remotely from the host for some backends
@@ -113,9 +158,15 @@ def _convert_image(prefix, source, dest, out_format, run_as_root=True):
             volume_utils.check_for_odirect_support(source,
                                                    dest,
                                                    'oflag=direct')):
-        cmd = prefix + ('qemu-img', 'convert',
-                        '-t', 'none',
-                        '-O', out_format, source, dest)
+        cache_mode = 'none'
+    else:
+        # use default
+        cache_mode = None
+
+    cmd = _get_qemu_convert_cmd(source, dest, out_format,
+                                out_subformat=out_subformat,
+                                cache_mode=cache_mode,
+                                prefix=prefix)
 
     start_time = timeutils.utcnow()
     utils.execute(*cmd, run_as_root=run_as_root)
@@ -138,17 +189,35 @@ def _convert_image(prefix, source, dest, out_format, run_as_root=True):
     LOG.info(msg, {"sz": fsz_mb, "mbps": mbps})
 
 
-def convert_image(source, dest, out_format, run_as_root=True, throttle=None):
+def convert_image(source, dest, out_format, out_subformat=None,
+                  run_as_root=True, throttle=None):
     if not throttle:
         throttle = throttling.Throttle.get_default()
     with throttle.subcommand(source, dest) as throttle_cmd:
         _convert_image(tuple(throttle_cmd['prefix']),
-                       source, dest,
-                       out_format, run_as_root=run_as_root)
+                       source, dest, out_format,
+                       out_subformat=out_subformat,
+                       run_as_root=run_as_root)
 
 
 def resize_image(source, size, run_as_root=False):
     """Changes the virtual size of the image."""
+    info = qemu_img_info(source)
+    fmt = info.file_format
+    if fmt in ('vpc', 'vhdx', 'vhd'):
+        LOG.warn(_LW("qemu-img does not support resizing vhd/x images."
+                     "For this reason, an intermediary conversion is used in "
+                     "order to perform the requested resize. The image will "
+                     "have dynamic subformat."))
+        with temporary_file() as tmp_path:
+            convert_image(source, tmp_path, 'raw', run_as_root=run_as_root)
+            _resize_image(tmp_path, size, run_as_root)
+            convert_image(tmp_path, source, fmt, run_as_root=run_as_root)
+    else:
+        _resize_image(source, size, run_as_root)
+
+
+def _resize_image(source, size, run_as_root=False):
     cmd = ('qemu-img', 'resize', source, '%sG' % size)
     utils.execute(*cmd, run_as_root=run_as_root)
 
@@ -229,7 +298,7 @@ def fetch_to_raw(context, image_service,
 def fetch_to_volume_format(context, image_service,
                            image_id, dest, volume_format, blocksize,
                            user_id=None, project_id=None, size=None,
-                           run_as_root=True):
+                           volume_subformat=None, run_as_root=True):
     qemu_img = True
     image_meta = image_service.show(context, image_id)
 
@@ -314,16 +383,27 @@ def fetch_to_volume_format(context, image_service,
         # malicious.
         LOG.debug("%s was %s, converting to %s ", image_id, fmt, volume_format)
         convert_image(tmp, dest, volume_format,
+                      out_subformat=volume_subformat,
                       run_as_root=run_as_root)
 
         data = qemu_img_info(dest, run_as_root=run_as_root)
-        if data.file_format != volume_format:
+
+        if not _validate_file_format(data, volume_format):
             raise exception.ImageUnacceptable(
                 image_id=image_id,
                 reason=_("Converted to %(vol_format)s, but format is "
                          "now %(file_format)s") % {'vol_format': volume_format,
                                                    'file_format': data.
                                                    file_format})
+
+
+def _validate_file_format(image_data, expected_format):
+    if image_data.file_format == expected_format:
+        return True
+    elif image_data.file_format == 'vpc' and expected_format == 'vhd':
+        # qemu-img still uses the legacy 'vpc' name for the vhd format.
+        return True
+    return False
 
 
 def upload_volume(context, image_service, image_meta, volume_path,

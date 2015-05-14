@@ -24,12 +24,16 @@ import os
 from oslo_config import cfg
 from oslo_log import log as logging
 
+from cinder import exception
+from cinder.i18n import _
 from cinder.image import image_utils
 from cinder.openstack.common import fileutils
 from cinder.volume import driver
 from cinder.volume.drivers.windows import constants
+from cinder.volume.drivers.windows import imagecache
 from cinder.volume.drivers.windows import vhdutils
 from cinder.volume.drivers.windows import windows_utils
+from cinder.volume import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -50,6 +54,7 @@ class WindowsDriver(driver.ISCSIDriver):
 
     def __init__(self, *args, **kwargs):
         super(WindowsDriver, self).__init__(*args, **kwargs)
+        self._imagecache = imagecache.WindowsImageCache()
         self.configuration = kwargs.get('configuration', None)
         if self.configuration:
             self.configuration.append_config_values(windows_opts)
@@ -66,6 +71,11 @@ class WindowsDriver(driver.ISCSIDriver):
     def check_for_setup_error(self):
         """Check that the driver is working and can communicate."""
         self.utils.check_for_setup_error()
+        diff_images_supported = self.utils.check_min_windows_version(6, 3)
+        if CONF.imagecache.use_cow_images and not diff_images_supported:
+            err_msg = _("Windows Server 2012 R2 or later is required in "
+                        "order to use differencing images as iSCSI disks.")
+            raise exception.VolumeBackendAPIException(err_msg)
 
     def initialize_connection(self, volume, connector):
         """Driver entry point to attach a volume to an instance."""
@@ -128,32 +138,40 @@ class WindowsDriver(driver.ISCSIDriver):
         snapshot_name = snapshot['name']
         self.utils.delete_snapshot(snapshot_name)
 
-    def _do_export(self, _ctx, volume, ensure=False):
-        """Do all steps to get disk exported as LUN 0 at separate target.
+    def ensure_export(self, context, volume):
+        # iSCSI targets exported by WinTarget persist after host reboot.
+        pass
 
-        :param volume: reference of volume to be exported
-        :param ensure: if True, ignore errors caused by already existing
-            resources
-        :return: iscsiadm-formatted provider location string
-        """
+    def create_export(self, context, volume):
+        """Driver entry point to get the export info for a new volume."""
+        # Since the iSCSI targets are not reused, being deleted when the
+        # volume is detached, we should clean up existing targets before
+        # creating a new one.
+        self.remove_export(context, volume)
+
         target_name = "%s%s" % (self.configuration.iscsi_target_prefix,
                                 volume['name'])
-        self.utils.create_iscsi_target(target_name, ensure)
+        updates = {'provider_location': target_name}
+        self.utils.create_iscsi_target(target_name)
 
+        if self.configuration.use_chap_auth:
+            chap_username = (self.configuration.chap_username or
+                             utils.generate_username())
+            chap_password = (self.configuration.chap_password or
+                             utils.generate_password())
+
+            self.utils.set_chap_credentials(target_name,
+                                            chap_username,
+                                            chap_password)
+
+            updates['provider_auth'] = ' '.join(('CHAP',
+                                                 chap_username,
+                                                 chap_password))
         # Get the disk to add
         vol_name = volume['name']
         self.utils.add_disk_to_target(vol_name, target_name)
 
-        return target_name
-
-    def ensure_export(self, context, volume):
-        """Driver entry point to get the export info for an existing volume."""
-        self._do_export(context, volume, ensure=True)
-
-    def create_export(self, context, volume):
-        """Driver entry point to get the export info for a new volume."""
-        loc = self._do_export(context, volume, ensure=False)
-        return {'provider_location': loc}
+        return updates
 
     def remove_export(self, context, volume):
         """Driver entry point to remove an export for a volume.
@@ -167,19 +185,18 @@ class WindowsDriver(driver.ISCSIDriver):
         """Fetch the image from image_service and create a volume using it."""
         # Convert to VHD and file back to VHD
         vhd_type = self.utils.get_supported_vhd_type()
-        with image_utils.temporary_file(suffix='.vhd') as tmp:
-            volume_path = self.local_path(volume)
-            image_utils.fetch_to_vhd(context, image_service, image_id, tmp,
-                                     self.configuration.volume_dd_blocksize)
-            # The vhd must be disabled and deleted before being replaced with
-            # the desired image.
-            self.utils.change_disk_status(volume['name'], False)
-            os.unlink(volume_path)
-            self.vhdutils.convert_vhd(tmp, volume_path,
-                                      vhd_type)
-            self.vhdutils.resize_vhd(volume_path,
-                                     volume['size'] << 30)
-            self.utils.change_disk_status(volume['name'], True)
+        volume_subformat = constants.VHD_SUBFORMAT_MAP[vhd_type]
+        volume_path = self.local_path(volume)
+        volume_format = os.path.splitext(volume_path)[1][1:]
+
+        # The vhd must be disabled and deleted before being replaced with
+        # the desired image.
+        self.utils.change_disk_status(volume['name'], False)
+        os.unlink(volume_path)
+        self._imagecache.get_image(context, image_service, image_id,
+                                   volume_path, volume_format, volume['size'],
+                                   image_subformat=volume_subformat)
+        self.utils.change_disk_status(volume['name'], True)
 
     def copy_volume_to_image(self, context, volume, image_service, image_meta):
         """Copy the volume to the specified image."""
@@ -210,7 +227,6 @@ class WindowsDriver(driver.ISCSIDriver):
         """Creates a clone of the specified volume."""
         vol_name = volume['name']
         vol_size = volume['size']
-        src_vol_size = src_vref['size']
 
         new_vhd_path = self.local_path(volume)
         src_vhd_path = self.local_path(src_vref)
@@ -218,8 +234,7 @@ class WindowsDriver(driver.ISCSIDriver):
         self.utils.copy_vhd_disk(src_vhd_path,
                                  new_vhd_path)
 
-        if self.utils.is_resize_needed(new_vhd_path, vol_size, src_vol_size):
-            self.vhdutils.resize_vhd(new_vhd_path, vol_size << 30)
+        self.utils.extend_vhd_if_needed(new_vhd_path, vol_size)
 
         self.utils.import_wt_disk(new_vhd_path, vol_name)
 

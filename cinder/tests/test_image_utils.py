@@ -28,46 +28,47 @@ from cinder.volume import throttling
 
 
 class TestQemuImgInfo(test.TestCase):
-    @mock.patch('cinder.openstack.common.imageutils.QemuImgInfo')
-    @mock.patch('cinder.utils.execute')
-    def test_qemu_img_info(self, mock_exec, mock_info):
-        mock_out = mock.sentinel.out
-        mock_err = mock.sentinel.err
-        test_path = mock.sentinel.path
-        mock_exec.return_value = (mock_out, mock_err)
-
-        output = image_utils.qemu_img_info(test_path)
-        mock_exec.assert_called_once_with('env', 'LC_ALL=C', 'qemu-img',
-                                          'info', test_path, run_as_root=True)
-        self.assertEqual(mock_info.return_value, output)
-
-    @mock.patch('cinder.openstack.common.imageutils.QemuImgInfo')
-    @mock.patch('cinder.utils.execute')
-    def test_qemu_img_info_not_root(self, mock_exec, mock_info):
-        mock_out = mock.sentinel.out
-        mock_err = mock.sentinel.err
-        test_path = mock.sentinel.path
-        mock_exec.return_value = (mock_out, mock_err)
-
-        output = image_utils.qemu_img_info(test_path, run_as_root=False)
-        mock_exec.assert_called_once_with('env', 'LC_ALL=C', 'qemu-img',
-                                          'info', test_path, run_as_root=False)
-        self.assertEqual(mock_info.return_value, output)
-
     @mock.patch('cinder.image.image_utils.os')
+    @mock.patch.object(image_utils, '_is_vhd')
     @mock.patch('cinder.openstack.common.imageutils.QemuImgInfo')
     @mock.patch('cinder.utils.execute')
-    def test_qemu_img_info_on_nt(self, mock_exec, mock_info, mock_os):
+    def _test_qemu_img_info(self, mock_exec, mock_info, mock_is_vhd, mock_os,
+                            is_vhd=False, os_name='posix', run_as_root=False,
+                            enable_vhd_check=False):
         mock_out = mock.sentinel.out
         mock_err = mock.sentinel.err
         test_path = mock.sentinel.path
         mock_exec.return_value = (mock_out, mock_err)
-        mock_os.name = 'nt'
+        mock_is_vhd.return_value = is_vhd
+        mock_os.name = os_name
+        img_info = mock_info.return_value
+        img_info.file_format = 'raw'
+        self.flags(enable_vhd_check=enable_vhd_check)
 
-        output = image_utils.qemu_img_info(test_path)
-        mock_exec.assert_called_once_with('qemu-img', 'info', test_path,
-                                          run_as_root=True)
-        self.assertEqual(mock_info.return_value, output)
+        output = image_utils.qemu_img_info(test_path, run_as_root=run_as_root)
+
+        expected_args = ('qemu-img', 'info', test_path)
+        if os_name != 'nt':
+            expected_args = ('env', 'LC_ALL=C') + expected_args
+        mock_exec.assert_called_once_with(*expected_args,
+                                          run_as_root=run_as_root)
+        self.assertEqual(img_info, output)
+        self.assertEqual(enable_vhd_check, mock_is_vhd.called)
+        if is_vhd and enable_vhd_check:
+            self.assertEqual('vpc', img_info.file_format)
+
+    def test_qemu_img_info_not_root(self):
+        self._test_qemu_img_info()
+
+    def test_qemu_img_info_on_nt(self):
+        self._test_qemu_img_info(os_name='nt')
+
+    def test_qemu_img_info_vhd_image(self):
+        # Ensure that if a vhd is wrongfully reported as raw due to a known
+        # qemu-img bug and the vhd check is enabled, the method being tested,
+        # will return the right image format.
+        self._test_qemu_img_info(is_vhd=True,
+                                 enable_vhd_check=True)
 
     @mock.patch('cinder.utils.execute')
     def test_get_qemu_img_version(self, mock_exec):
@@ -132,7 +133,7 @@ class TestConvertImage(test.TestCase):
 
             self.assertIsNone(output)
             mock_exec.assert_called_once_with('cgcmd', 'qemu-img', 'convert',
-                                              '-t', 'none', '-O', out_format,
+                                              '-O', out_format, '-t', 'none',
                                               source, dest, run_as_root=True)
 
         mock_exec.reset_mock()
@@ -151,39 +152,79 @@ class TestConvertImage(test.TestCase):
     @mock.patch('cinder.image.image_utils.os.stat')
     @mock.patch('cinder.utils.execute')
     @mock.patch('cinder.utils.is_blk_device', return_value=False)
-    def test_defaults_not_block_dev(self, mock_isblk, mock_exec,
-                                    mock_stat, mock_odirect):
+    def test_kwargs_not_block_dev(self, mock_isblk, mock_exec,
+                                  mock_stat, mock_odirect):
         source = mock.sentinel.source
         dest = mock.sentinel.dest
         out_format = mock.sentinel.out_format
         mock_stat.return_value.st_size = 1048576
+        out_subformat = 'fake_subformat'
 
-        output = image_utils.convert_image(source, dest, out_format)
+        output = image_utils.convert_image(source, dest, out_format,
+                                           out_subformat=out_subformat)
 
         self.assertIsNone(output)
         mock_exec.assert_called_once_with('qemu-img', 'convert', '-O',
-                                          out_format, source, dest,
+                                          out_format, '-o',
+                                          'subformat=%s' % out_subformat,
+                                          source, dest,
                                           run_as_root=True)
 
 
 class TestResizeImage(test.TestCase):
-    @mock.patch('cinder.utils.execute')
-    def test_defaults(self, mock_exec):
-        source = mock.sentinel.source
-        size = mock.sentinel.size
-        output = image_utils.resize_image(source, size)
-        self.assertIsNone(output)
-        mock_exec.assert_called_once_with('qemu-img', 'resize', source,
-                                          'sentinel.sizeG', run_as_root=False)
+    @mock.patch.object(image_utils, 'qemu_img_info')
+    @mock.patch.object(image_utils, 'convert_image')
+    @mock.patch.object(image_utils, '_resize_image')
+    @mock.patch.object(image_utils, 'temporary_file')
+    def _test_resize_image(self, mock_temp_file, mock_resize, mock_convert,
+                           mock_qemu_img_info, image_format):
+        mock_qemu_img_info.return_value.file_format = image_format
+        mock_temp_file.return_value.__enter__.return_value = (
+            mock.sentinel.temp_file_path)
+        run_as_root = False
+
+        image_utils.resize_image(mock.sentinel.image_path,
+                                 mock.sentinel.new_size,
+                                 run_as_root=run_as_root)
+
+        if image_format in ('vpc', 'vhdx', 'vhd'):
+            resized_image = mock.sentinel.temp_file_path
+            mock_convert.assert_has_calls(
+                [mock.call(mock.sentinel.image_path,
+                           mock.sentinel.temp_file_path,
+                           'raw', run_as_root=run_as_root),
+                 mock.call(mock.sentinel.temp_file_path,
+                           mock.sentinel.image_path,
+                           image_format, run_as_root=run_as_root)])
+        else:
+            resized_image = mock.sentinel.image_path
+
+        mock_resize.assert_called_once_with(resized_image,
+                                            mock.sentinel.new_size,
+                                            run_as_root)
+
+    def test_resize_raw_image(self):
+        self._test_resize_image(image_format='raw')
+
+    def test_resize_vhd_image(self):
+        self._test_resize_image(image_format='vpc')
 
     @mock.patch('cinder.utils.execute')
-    def test_run_as_root(self, mock_exec):
+    def _test_do_resize_image(self, mock_exec, run_as_root=False):
         source = mock.sentinel.source
         size = mock.sentinel.size
-        output = image_utils.resize_image(source, size, run_as_root=True)
+        output = image_utils._resize_image(source, size,
+                                           run_as_root=run_as_root)
         self.assertIsNone(output)
         mock_exec.assert_called_once_with('qemu-img', 'resize', source,
-                                          'sentinel.sizeG', run_as_root=True)
+                                          'sentinel.sizeG',
+                                          run_as_root=run_as_root)
+
+    def test_do_resize_image(self):
+        self._test_do_resize_image()
+
+    def test_do_resize_image_run_as_root(self):
+        self._test_do_resize_image(run_as_root=True)
 
 
 class TestFetch(test.TestCase):
@@ -602,6 +643,7 @@ class TestFetchToVolumeFormat(test.TestCase):
         self.assertFalse(mock_repl_xen.called)
         self.assertFalse(mock_copy.called)
         mock_convert.assert_called_once_with(tmp, dest, volume_format,
+                                             out_subformat=None,
                                              run_as_root=True)
 
     @mock.patch('cinder.image.image_utils.convert_image')
@@ -621,6 +663,7 @@ class TestFetchToVolumeFormat(test.TestCase):
         image_id = mock.sentinel.image_id
         dest = mock.sentinel.dest
         volume_format = mock.sentinel.volume_format
+        volume_subformat = mock.sentinel.volume_subformat
         blocksize = mock.sentinel.blocksize
         user_id = mock.sentinel.user_id
         project_id = mock.sentinel.project_id
@@ -636,6 +679,7 @@ class TestFetchToVolumeFormat(test.TestCase):
         output = image_utils.fetch_to_volume_format(
             ctxt, image_service, image_id, dest, volume_format, blocksize,
             user_id=user_id, project_id=project_id, size=size,
+            volume_subformat=volume_subformat,
             run_as_root=run_as_root)
 
         self.assertIsNone(output)
@@ -650,6 +694,7 @@ class TestFetchToVolumeFormat(test.TestCase):
         self.assertFalse(mock_repl_xen.called)
         self.assertFalse(mock_copy.called)
         mock_convert.assert_called_once_with(tmp, dest, volume_format,
+                                             out_subformat=volume_subformat,
                                              run_as_root=run_as_root)
 
     @mock.patch('cinder.image.image_utils.convert_image')
@@ -937,14 +982,15 @@ class TestFetchToVolumeFormat(test.TestCase):
     @mock.patch('cinder.image.image_utils.qemu_img_info')
     @mock.patch('cinder.image.image_utils.temporary_file')
     @mock.patch('cinder.image.image_utils.CONF')
-    def test_format_mismatch(self, mock_conf, mock_temp, mock_info, mock_fetch,
-                             mock_is_xen, mock_repl_xen, mock_copy,
-                             mock_convert):
+    def _test_format_name_mismatch(self, mock_conf, mock_temp, mock_info,
+                                   mock_fetch, mock_is_xen, mock_repl_xen,
+                                   mock_copy, mock_convert,
+                                   legacy_format_name=False):
         ctxt = mock.sentinel.context
         image_service = mock.Mock()
         image_id = mock.sentinel.image_id
         dest = mock.sentinel.dest
-        volume_format = mock.sentinel.volume_format
+        volume_format = 'vhd'
         blocksize = mock.sentinel.blocksize
         user_id = mock.sentinel.user_id
         project_id = mock.sentinel.project_id
@@ -952,17 +998,23 @@ class TestFetchToVolumeFormat(test.TestCase):
         run_as_root = mock.sentinel.run_as_root
 
         data = mock_info.return_value
-        data.file_format = mock.sentinel.file_format
+        data.file_format = 'vpc' if legacy_format_name else 'raw'
         data.backing_file = None
         data.virtual_size = 1234
         tmp = mock_temp.return_value.__enter__.return_value
 
-        self.assertRaises(
-            exception.ImageUnacceptable,
-            image_utils.fetch_to_volume_format,
-            ctxt, image_service, image_id, dest, volume_format, blocksize,
-            user_id=user_id, project_id=project_id, size=size,
-            run_as_root=run_as_root)
+        if legacy_format_name:
+            image_utils.fetch_to_volume_format(
+                ctxt, image_service, image_id, dest, volume_format, blocksize,
+                user_id=user_id, project_id=project_id, size=size,
+                run_as_root=run_as_root)
+        else:
+            self.assertRaises(
+                exception.ImageUnacceptable,
+                image_utils.fetch_to_volume_format,
+                ctxt, image_service, image_id, dest, volume_format, blocksize,
+                user_id=user_id, project_id=project_id, size=size,
+                run_as_root=run_as_root)
 
         image_service.show.assert_called_once_with(ctxt, image_id)
         mock_temp.assert_called_once_with()
@@ -975,7 +1027,16 @@ class TestFetchToVolumeFormat(test.TestCase):
         self.assertFalse(mock_repl_xen.called)
         self.assertFalse(mock_copy.called)
         mock_convert.assert_called_once_with(tmp, dest, volume_format,
+                                             out_subformat=None,
                                              run_as_root=run_as_root)
+
+    def test_format_mismatch(self):
+        self._test_format_name_mismatch()
+
+    def test_format_name_mismatch_same_format(self):
+        # Make sure no exception is raised because of qemu-img still using
+        # the legacy 'vpc' format name if 'vhd' is requested.
+        self._test_format_name_mismatch(legacy_format_name=True)
 
     @mock.patch('cinder.image.image_utils.convert_image')
     @mock.patch('cinder.image.image_utils.volume_utils.copy_volume')
@@ -1024,6 +1085,7 @@ class TestFetchToVolumeFormat(test.TestCase):
         mock_repl_xen.assert_called_once_with(tmp)
         self.assertFalse(mock_copy.called)
         mock_convert.assert_called_once_with(tmp, dest, volume_format,
+                                             out_subformat=None,
                                              run_as_root=run_as_root)
 
 
