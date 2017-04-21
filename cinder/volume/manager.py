@@ -1193,6 +1193,9 @@ class VolumeManager(manager.CleanableManager,
                              'service': volume_ref.service_topic_queue})
                 return
 
+            volume_ref.status = 'cloning'
+            volume_ref.save()
+
             image_volume = self._clone_image_volume(ctx,
                                                     volume_ref,
                                                     image_meta)
