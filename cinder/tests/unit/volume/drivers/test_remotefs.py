@@ -428,6 +428,25 @@ class RemoteFsSnapDriverTestCase(test.TestCase):
                                  basedir=basedir,
                                  valid_backing_file=False)
 
+    @mock.patch.object(remotefs.RemoteFSSnapDriver, '_local_volume_dir')
+    @mock.patch.object(remotefs.RemoteFSSnapDriver,
+                       'get_active_image_from_info')
+    def test_local_path_active_image(self, mock_get_active_img,
+                                     mock_local_vol_dir):
+        fake_vol_dir = 'fake_vol_dir'
+        fake_active_img = 'fake_active_img_fname'
+
+        mock_get_active_img.return_value = fake_active_img
+        mock_local_vol_dir.return_value = fake_vol_dir
+
+        active_img_path = self._driver._local_path_active_image(
+            mock.sentinel.volume)
+        exp_act_img_path = os.path.join(fake_vol_dir, fake_active_img)
+
+        self.assertEqual(exp_act_img_path, active_img_path)
+        mock_get_active_img.assert_called_once_with(mock.sentinel.volume)
+        mock_local_vol_dir.assert_called_once_with(mock.sentinel.volume)
+
     def test_create_cloned_volume(self):
         drv = self._driver
 

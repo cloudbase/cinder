@@ -545,6 +545,73 @@ class WindowsSmbFsTestCase(test.TestCase):
         else:
             fake_create_diff.assert_not_called()
 
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       '_check_extend_volume_support')
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       '_local_path_active_image')
+    def test_extend_volume(self, mock_get_active_img,
+                           mock_check_ext_support):
+        volume = fake_volume.fake_volume_obj(self.context)
+        new_size = volume.size + 1
+
+        self._smbfs_driver.extend_volume(volume, new_size)
+
+        mock_check_ext_support.assert_called_once_with(volume, new_size)
+        mock_get_active_img.assert_called_once_with(volume)
+        self._vhdutils.resize_vhd.assert_called_once_with(
+            mock_get_active_img.return_value,
+            new_size * units.Gi,
+            is_file_max_size=False)
+
+    @ddt.data({'snapshots_exist': True},
+              {'vol_fmt': smbfs.WindowsSmbfsDriver._DISK_FORMAT_VHD,
+               'snapshots_exist': True,
+               'expected_exc': exception.InvalidVolume},
+              {'share_eligible': False,
+               'expected_exc': exception.ExtendVolumeError})
+    @ddt.unpack
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       '_is_share_eligible')
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       'get_volume_format')
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       '_local_path_active_image')
+    @mock.patch.object(smbfs.WindowsSmbfsDriver,
+                       'local_path')
+    def test_check_extend_support(self, mock_local_path,
+                                  mock_get_active_img,
+                                  mock_get_volume_format,
+                                  mock_share_eligible,
+                                  vol_fmt=None, snapshots_exist=False,
+                                  share_eligible=True,
+                                  expected_exc=None):
+        vol_fmt = vol_fmt or self._smbfs_driver._DISK_FORMAT_VHDX
+
+        volume = fake_volume.fake_volume_obj(
+            self.context, provider_location='fake_provider_location')
+        new_size = volume.size + 1
+
+        mock_local_path.return_value = mock.sentinel.vol_path
+        mock_get_active_img.return_value = (mock.sentinel.vol_path
+                                            if not snapshots_exist
+                                            else mock.sentinel.latest_img)
+        mock_share_eligible.return_value = share_eligible
+        mock_get_volume_format.return_value = vol_fmt
+
+        if expected_exc:
+            self.assertRaises(expected_exc,
+                              self._smbfs_driver._check_extend_volume_support,
+                              volume, new_size)
+        else:
+            self._smbfs_driver._check_extend_volume_support(volume, new_size)
+
+            mock_local_path.assert_called_once_with(volume)
+            mock_get_active_img.assert_called_once_with(volume)
+            mock_get_volume_format.assert_called_once_with(volume)
+            mock_share_eligible.assert_called_once_with(
+                volume.provider_location,
+                new_size - volume.size)
+
     @ddt.data({},
               {'delete_latest': True},
               {'volume_status': 'available'},

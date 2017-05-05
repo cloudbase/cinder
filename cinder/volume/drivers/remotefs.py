@@ -933,6 +933,13 @@ class RemoteFSSnapDriverBase(RemoteFSDriver):
 
         return snap_info['active']
 
+    def _local_path_active_image(self, volume):
+        active_fname = self.get_active_image_from_info(volume)
+        vol_dir = self._local_volume_dir(volume)
+
+        active_fpath = os.path.join(vol_dir, active_fname)
+        return active_fpath
+
     def _create_cloned_volume(self, volume, src_vref):
         LOG.info(_LI('Cloning volume %(src)s to volume %(dst)s'),
                  {'src': src_vref.id,
