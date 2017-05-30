@@ -477,9 +477,9 @@ class WindowsSmbfsDriver(remotefs_drv.RemoteFSPoolMixin,
         merged_img_path = os.path.join(
             self._local_volume_dir(snapshot.volume),
             file_to_merge)
-        if snap_info['active'] == file_to_merge:
+        if snap_info['active'].lower() == file_to_merge.lower():
             new_active_file_path = self._vhdutils.get_vhd_parent_path(
-                merged_img_path)
+                merged_img_path).lower()
             snap_info['active'] = os.path.basename(new_active_file_path)
 
         self._delete(merged_img_path)
