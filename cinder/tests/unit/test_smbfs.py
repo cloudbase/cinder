@@ -17,7 +17,6 @@ import os
 
 import ddt
 import mock
-from oslo_utils import fileutils
 
 from cinder import context
 from cinder import db

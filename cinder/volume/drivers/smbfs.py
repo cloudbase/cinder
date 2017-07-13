@@ -41,9 +41,7 @@ volume_opts = [
                default='$state_path/allocation_data',
                help=('The path of the automatically generated file containing '
                      'information about volume disk space allocation.'),
-               deprecated_for_removal=True,
-               deprecated_since="8.1.1",
-               deprecated_reason="This allocation file is no longer used."),
+               deprecated_for_removal=True),
     cfg.StrOpt('smbfs_default_volume_format',
                default='qcow2',
                choices=['raw', 'qcow2', 'vhd', 'vhdx'],
