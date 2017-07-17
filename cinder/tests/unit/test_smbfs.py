@@ -61,6 +61,8 @@ class SmbFsTestCase(test.TestCase):
         super(SmbFsTestCase, self).setUp()
 
         self._FAKE_SMBFS_CONFIG = mock.MagicMock(
+            max_over_subscription_ratio = 2,
+            reserved_percentage=50,
             smbfs_oversub_ratio = 2,
             smbfs_used_ratio = 0.5,
             smbfs_shares_config = '/fake/config/path',
